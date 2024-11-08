@@ -107,6 +107,19 @@ class FeedFoward(nn.Module):
         return self.net(x)
 
 
+class Block(nn.Module):
+    def __init__(self, n_head, n_embd):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa_head = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedFoward(n_embd)
+
+    def forward(self, x):
+        x = self.sa_head(x)
+        x = self.ffwd(x)
+        return x
+
+
 class BigramLanguageModel(nn.Module):
 
     def __init__(self):
@@ -114,9 +127,11 @@ class BigramLanguageModel(nn.Module):
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)  ## 将token映射为一个n_embd维的向量，这里的token即单词索引
         self.position_embedding_table = nn.Embedding(block_size, n_embd)  ## 将位置索引映射为一个n_emb维的向量
-        self.sa_head = MultiHeadAttention(4, n_embd // 4)  ## self_attention head
-        ## 4个头，每个头最终生成B, T, n_embd//4 的tensor ,最后在最后一个维度连起来作为输出 就像卷积中的多通道
-        self.ffwd = FeedFoward(n_embd)
+        self.blocks = nn.Sequential(
+            Block(4, n_embd),  ## 每个block内有四个head，head输入维度 n_embd, 输出head_size 最后在将四个head输出在head_size维度相加
+            Block(4, n_embd),  ## feedfoward 输入维度是n_embd, 输出也是n_embd
+            Block(4, n_embd)  ## 连续三个block
+        )
         self.lm_embd = nn.Linear(n_embd, vocab_size)  ##
 
     def forward(self, idx, targets=None):
@@ -125,8 +140,7 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx)  # (B,T, n_embd)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))  ## arange生成 T个索引，返回(T, n_embd)
         x = tok_emb + pos_emb  ## 广播后则为 (B, T, n_embd)  此时x有语义信息和位置信息
-        x = self.sa_head(x)  ## (B, T, head_size) 此时head_size = n_embd  ## 此时x通过上下文改变了自身的语义信息
-        x = self.ffwd(x)  ## (B,T,n_embd)
+        x = self.blocks(x)  ## 输出为(B,T ,n_embd)
         logits = self.lm_embd(x)  ## （B, T, vacab_size) 通过线性层映射到 vacab_size 维度得到下一个token的预测。此时的预测考虑了前文的语义信息
 
         if targets is None:
