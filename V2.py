@@ -94,6 +94,19 @@ class MultiHeadAttention(nn.Module):
         return torch.cat([h(x) for h in self.heads], dim=-1)
 
 
+class FeedFoward(nn.Module):
+
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, n_embd),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class BigramLanguageModel(nn.Module):
 
     def __init__(self):
@@ -103,6 +116,7 @@ class BigramLanguageModel(nn.Module):
         self.position_embedding_table = nn.Embedding(block_size, n_embd)  ## 将位置索引映射为一个n_emb维的向量
         self.sa_head = MultiHeadAttention(4, n_embd // 4)  ## self_attention head
         ## 4个头，每个头最终生成B, T, n_embd//4 的tensor ,最后在最后一个维度连起来作为输出 就像卷积中的多通道
+        self.ffwd = FeedFoward(n_embd)
         self.lm_embd = nn.Linear(n_embd, vocab_size)  ##
 
     def forward(self, idx, targets=None):
@@ -112,6 +126,7 @@ class BigramLanguageModel(nn.Module):
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))  ## arange生成 T个索引，返回(T, n_embd)
         x = tok_emb + pos_emb  ## 广播后则为 (B, T, n_embd)  此时x有语义信息和位置信息
         x = self.sa_head(x)  ## (B, T, head_size) 此时head_size = n_embd  ## 此时x通过上下文改变了自身的语义信息
+        x = self.ffwd(x)  ## (B,T,n_embd)
         logits = self.lm_embd(x)  ## （B, T, vacab_size) 通过线性层映射到 vacab_size 维度得到下一个token的预测。此时的预测考虑了前文的语义信息
 
         if targets is None:
@@ -158,7 +173,6 @@ for i in range(max_iters):
     if i % eval_interval == 0:
         losses = estimate_loss()
         print(f"step: {i} train_loss:{losses['train']:.4f}, valid_loss: {losses['val']:.4f}")
-
 
 ### generate data
 print(decode(m.generate(torch.zeros((1, 1), dtype=torch.long, device=device), max_new_tokens=500)[0].tolist()))
