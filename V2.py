@@ -11,6 +11,8 @@ learning_rate = 1e-3
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200  ## 计算损失时的步数 即计算200次损失并求均值
 n_embd = 32
+n_layer = 3  ## how many blocks in model and each blocks: norm->multihead->norm->ffd  (residual connect be applied)
+n_head = 4 ## how many head in multihead layer
 # ------------
 torch.manual_seed(1337)
 
@@ -59,6 +61,54 @@ def estimate_loss():
     return out
 
 
+class BatchNorm1d(nn.Module):
+    def __init__(self, dim, eps=1e-5, momentum=0.1):
+        super().__init__()
+        self.eps = eps
+        self.momentum = momentum
+        self.train = True
+        ## parameter
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.beta = nn.Parameter(torch.zeros(dim))
+        ## buffer
+        self.running_mean = torch.zeros(dim)
+        self.running_var = torch.ones(dim)
+
+    def forward(self, x):
+        ## x: (B, C)
+        if self.train:
+            x_mean = x.mean(0, keepdim=True)  ## (1, C)
+            x_var = x.var(0, keepdim=True)  ## (1, C)
+        else:
+            x_mean = self.running_mean
+            x_var = self.running_var
+        x_hat = (x - x_mean) / torch.sqrt(x_var + self.eps)
+        out = self.gamma * x_hat + self.beta
+        ## updata the buffers
+        if self.train:
+            with torch.no_grad():
+                self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * x_mean
+                self.running_var = (1 - self.momentum) * self.running_var + self.momentum * x_var
+        return out
+
+
+class LayerNorm1d(nn.Module):  # (used to be BatchNorm1d)
+
+    def __init__(self, dim, eps=1e-5, momentum=0.1):
+        super().__init__()
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.beta = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        # calculate the forward pass
+        x_mean = x.mean(-1, keepdim=True)  # layer mean  即最后一个特征维度的mean
+        x_var = x.var(-1, keepdim=True)  # layer variance
+        x_hat = (x - x_mean) / torch.sqrt(x_var + self.eps)  # normalize to unit variance
+        out = self.gamma * x_hat + self.beta
+        return out
+
+
 class Head(nn.Module):
     def __init__(self, head_size):
         super().__init__()
@@ -97,7 +147,7 @@ class MultiHeadAttention(nn.Module):
         return out
 
 
-class FeedFoward(nn.Module):
+class FeedForward(nn.Module):
 
     def __init__(self, n_embd):
         super().__init__()
@@ -116,11 +166,13 @@ class Block(nn.Module):
         super().__init__()
         head_size = n_embd // n_head
         self.sa_head = MultiHeadAttention(n_head, head_size)  ## 输入维度n_embd, 输出维度也是n_embd
-        self.ffwd = FeedFoward(n_embd)  ## 输入维度n_embd, 输出维度也是n_embd
+        self.ffwd = FeedForward(n_embd)  ## 输入维度n_embd, 输出维度也是n_embd
+        self.ln1 = LayerNorm1d(n_embd)
+        self.ln2 = LayerNorm1d(n_embd)
 
     def forward(self, x):
-        x = x + self.sa_head(x)
-        x = x + self.ffwd(x)
+        x = x + self.sa_head(self.ln1(x))  ## 和attention is all your need 论文中不同，目前习惯于在x输入head和feedforward之前norm
+        x = x + self.ffwd(self.ln2(x))
         return x
 
 
@@ -131,12 +183,11 @@ class BigramLanguageModel(nn.Module):
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)  ## 将token映射为一个n_embd维的向量，这里的token即单词索引
         self.position_embedding_table = nn.Embedding(block_size, n_embd)  ## 将位置索引映射为一个n_emb维的向量
-        self.blocks = nn.Sequential(
-            Block(4, n_embd),  ## 每个block内有四个head，head输入维度 n_embd, 输出head_size 最后在将四个head输出在head_size维度相加
-            Block(4, n_embd),  ## feedfoward 输入维度是n_embd, 输出也是n_embd
-            Block(4, n_embd)  ## 连续三个block
-        )
-        self.lm_embd = nn.Linear(n_embd, vocab_size)  ##
+        ## 每个block内有四个head，head输入维度 n_embd, 输出head_size 最后在将四个head输出在head_size维度相加
+        ## feedforward 输入维度是n_embd, 输出也是n_embd  n_layer 个block
+        self.blocks = nn.Sequential(*[Block(n_head=n_head, n_embd=n_embd) for _ in range(n_layer)])
+        self.ln_f = LayerNorm1d(n_embd)
+        self.lm_embd = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -145,6 +196,7 @@ class BigramLanguageModel(nn.Module):
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))  ## arange生成 T个索引，返回(T, n_embd)
         x = tok_emb + pos_emb  ## 广播后则为 (B, T, n_embd)  此时x有语义信息和位置信息
         x = self.blocks(x)  ## 输出为(B,T ,n_embd)
+        x = self.ln_f(x)  ## 输出为(B,T,n_embd)
         logits = self.lm_embd(x)  ## （B, T, vacab_size) 通过线性层映射到 vacab_size 维度得到下一个token的预测。此时的预测考虑了前文的语义信息
 
         if targets is None:
