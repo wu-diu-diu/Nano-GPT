@@ -1,18 +1,21 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import time
 
 ## hyperparameters
-batch_size = 32  # how many independent sequences will we process in parallel?
-block_size = 8  # what is the maximum context length for predictions?
+batch_size = 64  # how many independent sequences will we process in parallel?
+## use 256 token to predict the 257th token
+block_size = 256  # what is the maximum context length for predictions?
 max_iters = 5000  # 训练步数
 eval_interval = 300  ## 评估损失的训练步间隔 每300步评估一次损失
-learning_rate = 1e-3
+learning_rate = 3e-4  ## 模型变大，学习率变小
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200  ## 计算损失时的步数 即计算200次损失并求均值
-n_embd = 32
-n_layer = 3  ## how many blocks in model and each blocks: norm->multihead->norm->ffd  (residual connect be applied)
-n_head = 4 ## how many head in multihead layer
+n_embd = 384
+n_layer = 6  ## how many blocks in model and each blocks: norm->multihead->norm->ffd  (residual connect be applied)
+n_head = 6 ## how many head in multihead layer
+dropout = 0.2
 # ------------
 torch.manual_seed(1337)
 
@@ -116,6 +119,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -127,6 +131,7 @@ class Head(nn.Module):
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  ##将wei的上三角不包括对角线，替换为负无穷大
         ## [:T, :T]是为了生成数据时，当输入x的token不足 block_size 时, 只取tril的T*T的小方阵来对应处理wei
         wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)  ## 此时wei是下三角阵 ，dropout 在最后一个维度上随机将元素置零 则随机阻止token之间的交流
         ## 对value进行加权求和
         v = self.value(x)  ## (B,T,head_size)
         out = wei @ v  ## (B, T, head_size)
@@ -140,10 +145,11 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_head)])
         self.proj = nn.Linear(n_embd, n_embd)  ## 对多个head的输出进一步进行线性变换
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.proj(out)
+        out = self.dropout(self.proj(out))
         return out
 
 
@@ -154,7 +160,8 @@ class FeedForward(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
             nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd)
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout)  ## 在最后一个维度上，即n_embd维度上对元素随机置0
         )
 
     def forward(self, x):
@@ -232,7 +239,7 @@ model = BigramLanguageModel()
 m = model.to(device)
 
 optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
-
+start_time = time.time()
 for i in range(max_iters):
     optimizer.zero_grad()
     xb, yb = get_batch('train')
@@ -244,5 +251,7 @@ for i in range(max_iters):
         losses = estimate_loss()
         print(f"step: {i} train_loss:{losses['train']:.4f}, valid_loss: {losses['val']:.4f}")
 
+end_time = (time.time() - start_time) / 60
+print(f"training time:{end_time:.2f} min")
 ### generate data
 print(decode(m.generate(torch.zeros((1, 1), dtype=torch.long, device=device), max_new_tokens=500)[0].tolist()))
